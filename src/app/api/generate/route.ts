@@ -9,7 +9,7 @@ type Variant = {
   direction: string;
 };
 
-type ProviderMode = "openrouter" | "openai";
+type ProviderMode = "openrouter" | "openai" | "google";
 
 type ProviderConfig = {
   apiKey: string;
@@ -17,7 +17,9 @@ type ProviderConfig = {
   missingEnvHint?: string;
 };
 const NEMOTRON_FREE_MODEL = "nvidia/nemotron-nano-12b-v2-vl:free";
-const DEFAULT_IMAGE_MODEL = "sourceful/riverflow-v2-fast";
+const DEFAULT_GOOGLE_IMAGE_MODEL = "google-ai-studio/gemini-2.5-flash-image";
+const DEFAULT_IMAGE_MODEL = DEFAULT_GOOGLE_IMAGE_MODEL;
+const GOOGLE_PREFIX = "google-ai-studio/";
 
 const VARIANTS: Variant[] = [
   {
@@ -35,9 +37,18 @@ const VARIANTS: Variant[] = [
 ];
 
 function resolveProviderConfig(model: string): ProviderConfig | null {
+  const isGoogle = model.startsWith(GOOGLE_PREFIX);
   const isFree = model === NEMOTRON_FREE_MODEL;
   const isFast = model === "sourceful/riverflow-v2-fast";
   const isPro = model === "sourceful/riverflow-v2-pro";
+
+  if (isGoogle) {
+    const apiKey = process.env.GOOGLE_AI_STUDIO_API_KEY?.trim();
+    if (!apiKey) {
+      return { apiKey: "", mode: "google", missingEnvHint: "GOOGLE_AI_STUDIO_API_KEY" };
+    }
+    return { apiKey, mode: "google" };
+  }
 
   if (isFree) {
     const apiKey = process.env.FREE_MODEL_API_KEY?.trim() || process.env.OPENROUTER_API_KEY?.trim();
@@ -122,6 +133,14 @@ function toDataUrl(bytes: ArrayBuffer, mimeType: string): string {
   return `data:${mimeType};base64,${base64}`;
 }
 
+function toBase64(bytes: ArrayBuffer): string {
+  return Buffer.from(bytes).toString("base64");
+}
+
+function toGoogleModelId(model: string): string {
+  return model.startsWith(GOOGLE_PREFIX) ? model.slice(GOOGLE_PREFIX.length) : model;
+}
+
 function extractOpenRouterImage(result: unknown): string | null {
   if (!result || typeof result !== "object") {
     return null;
@@ -141,6 +160,34 @@ function extractOpenRouterText(result: unknown): string | null {
 
   const content = (result as { choices?: Array<{ message?: { content?: string } }> }).choices?.[0]?.message?.content;
   return typeof content === "string" ? content.trim() : null;
+}
+
+function extractGoogleImage(result: unknown): string | null {
+  if (!result || typeof result !== "object") {
+    return null;
+  }
+
+  const parts = (result as { candidates?: Array<{ content?: { parts?: Array<unknown> } }> }).candidates?.[0]?.content?.parts;
+  if (!Array.isArray(parts)) {
+    return null;
+  }
+
+  for (const part of parts) {
+    if (!part || typeof part !== "object") {
+      continue;
+    }
+
+    const inlineData = (part as { inlineData?: { data?: string; mimeType?: string }; inline_data?: { data?: string; mime_type?: string } })
+      .inlineData;
+    const snakeInline = (part as { inline_data?: { data?: string; mime_type?: string } }).inline_data;
+    const data = inlineData?.data || snakeInline?.data;
+    const mime = inlineData?.mimeType || snakeInline?.mime_type || "image/png";
+    if (data) {
+      return `data:${mime};base64,${data}`;
+    }
+  }
+
+  return null;
 }
 
 async function generateWithOpenRouter(params: {
@@ -181,6 +228,50 @@ async function generateWithOpenRouter(params: {
 
   const result = (await response.json()) as unknown;
   return extractOpenRouterImage(result);
+}
+
+async function generateWithGoogleAIStudio(params: {
+  apiKey: string;
+  model: string;
+  prompt: string;
+  referenceBytes?: ArrayBuffer;
+  referenceMimeType?: string;
+}): Promise<string | null> {
+  const modelId = toGoogleModelId(params.model);
+  const parts: Array<Record<string, unknown>> = [{ text: params.prompt }];
+
+  if (params.referenceBytes && params.referenceMimeType) {
+    parts.push({
+      inline_data: {
+        mime_type: params.referenceMimeType,
+        data: toBase64(params.referenceBytes),
+      },
+    });
+  }
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${params.apiKey}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        contents: [{ parts }],
+        generationConfig: {
+          responseModalities: ["TEXT", "IMAGE"],
+        },
+      }),
+    },
+  );
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || `Google AI Studio request failed (${response.status}).`);
+  }
+
+  const result = (await response.json()) as unknown;
+  return extractGoogleImage(result);
 }
 
 async function refinePromptWithOpenRouter(params: {
@@ -246,14 +337,13 @@ export async function POST(request: Request) {
   const formData = await request.formData();
   const prompt = String(formData.get("prompt") ?? "").trim();
   const aspect = String(formData.get("aspect") ?? "16:9").trim();
-  const model = String(formData.get("model") ?? "sourceful/riverflow-v2-fast").trim();
+  const model = String(formData.get("model") ?? DEFAULT_GOOGLE_IMAGE_MODEL).trim();
   const referenceImage = formData.get("referenceImage");
 
   if (model.includes("embed")) {
     return new Response(
       JSON.stringify({
-        error:
-          `${model} is an embedding model. Thumbnail generation requires an image-generation model (for example sourceful/riverflow-v2-fast).`,
+        error: `${model} is an embedding model. Thumbnail generation requires an image-generation model.`,
       }),
       {
         status: 400,
@@ -320,11 +410,33 @@ export async function POST(request: Request) {
               imageModel = process.env.FREE_IMAGE_FALLBACK_MODEL?.trim() || DEFAULT_IMAGE_MODEL;
             }
 
-            image = await generateWithOpenRouter({
+            if (imageModel.startsWith(GOOGLE_PREFIX)) {
+              const googleKey = process.env.GOOGLE_AI_STUDIO_API_KEY?.trim();
+              if (!googleKey) {
+                throw new Error("Missing GOOGLE_AI_STUDIO_API_KEY for Google image fallback model.");
+              }
+              image = await generateWithGoogleAIStudio({
+                apiKey: googleKey,
+                model: imageModel,
+                prompt: finalPrompt,
+                referenceBytes: referenceMeta?.bytes,
+                referenceMimeType: referenceMeta?.type,
+              });
+            } else {
+              image = await generateWithOpenRouter({
+                apiKey: provider.apiKey,
+                model: imageModel,
+                prompt: finalPrompt,
+                referenceDataUrl: referenceMeta ? toDataUrl(referenceMeta.bytes, referenceMeta.type) : undefined,
+              });
+            }
+          } else if (provider.mode === "google") {
+            image = await generateWithGoogleAIStudio({
               apiKey: provider.apiKey,
-              model: imageModel,
-              prompt: finalPrompt,
-              referenceDataUrl: referenceMeta ? toDataUrl(referenceMeta.bytes, referenceMeta.type) : undefined,
+              model: effectiveModel,
+              prompt: basePrompt,
+              referenceBytes: referenceMeta?.bytes,
+              referenceMimeType: referenceMeta?.type,
             });
           } else if (openai) {
             const finalPrompt = basePrompt;

@@ -46,6 +46,7 @@ type StreamEvent =
 const GALLERY_STORAGE_KEY = "thumbly-gallery-v1";
 const ASPECT_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4", "3:2", "2:3", "4:5", "5:4", "21:9"];
 const MODEL_OPTIONS = [
+  { id: "google-ai-studio/gemini-2.5-flash-image", label: "Google AI Studio: Gemini Image" },
   { id: "nvidia/nemotron-nano-12b-v2-vl:free", label: "NVIDIA: Nemotron Nano 12B VL (Free)" },
   { id: "sourceful/riverflow-v2-fast", label: "Sourceful: Riverflow V2 Fast" },
   { id: "sourceful/riverflow-v2-pro", label: "Sourceful: Riverflow V2 Pro" },
@@ -135,7 +136,7 @@ function saveGallery(items: GalleryItem[]) {
 export default function Home() {
   const [theme, setTheme] = useState<Theme>("dark");
   const [aspect, setAspect] = useState("16:9");
-  const [model, setModel] = useState("sourceful/riverflow-v2-fast");
+  const [model, setModel] = useState("google-ai-studio/gemini-2.5-flash-image");
   const [prompt, setPrompt] = useState("");
   const [referenceImage, setReferenceImage] = useState<File | null>(null);
   const [slots, setSlots] = useState<Slot[]>(() => buildInitialSlots());
